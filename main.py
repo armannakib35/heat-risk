@@ -2,9 +2,11 @@ from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
+import time
 
 app = FastAPI(title="Real Street Heat Risk API")
 
+# --- CORS for Render deployment ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,29 +18,24 @@ app.add_middleware(
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
-
 HEADERS = {"User-Agent": "AI-Heat-Risk-Demo/1.0"}
 
+# --- Weather cache ---
+weather_cache = {}  # key: (lat, lon), value: {"time": timestamp, "data": (times, temps, humidity, feels_like)}
 
-def fetch_place_name(lat, lon):
-    try:
-        params = {
-            "format": "json",
-            "lat": lat,
-            "lon": lon,
-            "zoom": 18,
-            "addressdetails": 1,
-            "accept-language": "en",
-        }
-        r = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("display_name", "Unknown location")
-    except Exception:
-        return "Unknown location"
+CACHE_DURATION = 15 * 60  # 15 minutes
 
 
 def fetch_weather(lat, lon):
+    key = (round(lat, 4), round(lon, 4))
+    now = time.time()
+    # Return cached if not expired
+    if key in weather_cache:
+        cached = weather_cache[key]
+        if now - cached["time"] < CACHE_DURATION:
+            return cached["data"]
+
+    # Fetch new data
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -46,17 +43,36 @@ def fetch_weather(lat, lon):
         "forecast_days": 1,
         "timezone": "auto",
     }
-
     r = requests.get(WEATHER_URL, params=params, timeout=10)
     r.raise_for_status()
     data = r.json()
-
-    return (
+    result = (
         data["hourly"]["time"],
         data["hourly"]["temperature_2m"],
         data["hourly"]["relative_humidity_2m"],
         data["hourly"]["apparent_temperature"],
     )
+    # Cache it
+    weather_cache[key] = {"time": now, "data": result}
+    return result
+
+
+def fetch_place_name(lat, lon):
+    params = {
+        "format": "json",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 18,
+        "addressdetails": 1,
+        "accept-language": "en",
+    }
+    try:
+        r = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("display_name", "Unknown location")
+    except Exception:
+        return "Unknown location"
 
 
 def get_surface_score(surface):
@@ -103,6 +119,7 @@ def fallback_streets(lat, lon):
     ]
 
 
+# --- Routes ---
 @app.get("/")
 def home():
     return FileResponse("frontend.html")
@@ -115,19 +132,11 @@ def mobile_app():
 
 @app.get("/place")
 def get_place(lat: float = Query(...), lon: float = Query(...)):
-    return {
-        "latitude": lat,
-        "longitude": lon,
-        "place_name": fetch_place_name(lat, lon),
-    }
+    return {"latitude": lat, "longitude": lon, "place_name": fetch_place_name(lat, lon)}
 
 
 @app.get("/risk")
-def get_risk(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    surface: str = Query("Road / Concrete"),
-):
+def get_risk(lat: float = Query(...), lon: float = Query(...), surface: str = Query("Road / Concrete")):
     try:
         surface_score = get_surface_score(surface)
         times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
@@ -154,40 +163,24 @@ def get_risk(
                 "advice": advice,
             })
 
-        return {
-            "location": {"latitude": lat, "longitude": lon},
-            "surface": surface,
-            "results": outputs,
-        }
+        return {"location":{"latitude":lat,"longitude":lon},"surface":surface,"results":outputs}
 
     except Exception as e:
-        return {
-            "error": str(e),
-            "location": {"latitude": lat, "longitude": lon},
-            "surface": surface,
-            "results": [],
-        }
+        return {"error": str(e), "location":{"latitude":lat,"longitude":lon}, "surface":surface, "results":[]}
 
 
 @app.get("/streets")
-def get_streets(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    radius: int = Query(900),
-):
+def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = Query(900)):
+    """
+    Fetch nearby streets with fallback, limit to 20
+    """
     try:
         query = f"""
         [out:json][timeout:20];
         way["highway"](around:{radius},{lat},{lon});
         out center tags;
         """
-
-        r = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            headers=HEADERS,
-            timeout=20,
-        )
+        r = requests.post(OVERPASS_URL, data={"data": query}, headers={"User-Agent": "AI-Heat-Risk-Demo/1.0"}, timeout=20)
         r.raise_for_status()
         data = r.json()
 
@@ -198,47 +191,36 @@ def get_streets(
             try:
                 tags = element.get("tags", {})
                 center = element.get("center")
-
                 if not center:
                     continue
 
                 highway = tags.get("highway", "road")
                 name = tags.get("name:en") or tags.get("name") or f"Unnamed {highway}"
-
-                key = f"{name}-{round(center['lat'], 5)}-{round(center['lon'], 5)}"
+                key = f"{name}-{round(center['lat'],5)}-{round(center['lon'],5)}"
                 if key in seen:
                     continue
-
                 seen.add(key)
 
                 streets.append({
                     "name": name,
                     "lat": center["lat"],
                     "lon": center["lon"],
-                    "surface": highway_to_surface(highway),
+                    "surface": "Road / Concrete" if "road" in highway else "Mixed Area",
                     "highway_type": highway,
                     "is_real_osm": True,
                 })
 
-            except Exception:
+            except:
                 continue
 
-        if len(streets) == 0:
+        if len(streets)==0:
             streets = fallback_streets(lat, lon)
-            source = "Fallback demo streets"
+            source="Fallback demo streets"
         else:
-            source = "OpenStreetMap Overpass API"
+            source="OpenStreetMap Overpass API"
 
-        return {
-            "source": source,
-            "count": len(streets[:12]),
-            "streets": streets[:12],
-        }
+        return {"source":source,"count":len(streets[:20]),"streets":streets[:20]}
 
-    except Exception:
+    except:
         streets = fallback_streets(lat, lon)
-        return {
-            "source": "Fallback demo streets",
-            "count": len(streets),
-            "streets": streets,
-        }
+        return {"source":"Fallback demo streets","count":len(streets),"streets":streets}
