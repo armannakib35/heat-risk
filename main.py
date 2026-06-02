@@ -185,3 +185,64 @@ def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = 
         })
 
     return {"source": "OpenStreetMap Overpass API", "count": len(streets[:20]), "streets": streets[:20]}
+
+    
+@app.get("/street-risks")
+def get_street_risks(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    radius: int = Query(900)
+):
+    place_name = fetch_place_name(lat, lon)
+
+    times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
+
+    street_data = get_streets(lat, lon, radius)
+    streets = street_data.get("streets", [])
+
+    results = []
+
+    for street in streets:
+        surface_score = get_surface_score(street["surface"])
+
+        forecasts = []
+
+        for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
+            temp = temps[index]
+            hum = humidity[index]
+            apparent_temp = apparent_temps[index]
+
+            risk_score, level, advice = calculate_risk(
+                temp,
+                hum,
+                apparent_temp,
+                surface_score
+            )
+
+            forecasts.append({
+                "forecast": label,
+                "time": times[index],
+                "temperature": temp,
+                "humidity": hum,
+                "apparent_temperature": apparent_temp,
+                "risk_score": risk_score,
+                "level": level,
+                "advice": advice
+            })
+
+        results.append({
+            "name": street["name"],
+            "lat": street["lat"],
+            "lon": street["lon"],
+            "surface": street["surface"],
+            "highway_type": street["highway_type"],
+            "forecasts": forecasts
+        })
+
+    return {
+        "place_name": place_name,
+        "latitude": lat,
+        "longitude": lon,
+        "street_count": len(results),
+        "streets": results
+    }
