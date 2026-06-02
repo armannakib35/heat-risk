@@ -87,7 +87,7 @@ async function loadStreets(lat,lon){
   document.getElementById("result").innerHTML="Loading streets & heat risk...";
   streetMarkers.forEach(m=>map.removeLayer(m));
   streetMarkers=[];
-  const response=await fetch(`/streets?lat=${lat}&lon=${lon}&radius=900`);
+  const response=await fetch(`/streets?lat=${lat}&lon=${lon}&radius=700`);
   const data=await response.json();
   if(!data.streets || data.streets.length===0){
     document.getElementById("result").innerHTML=`<div class="card">No nearby streets found.</div>`;
