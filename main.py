@@ -1,8 +1,21 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import requests
+import logging
 
 app = FastAPI(title="Real Street Heat Risk API")
+
+# Enable CORS so frontend can call APIs from other devices
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or restrict to your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO)
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
@@ -19,13 +32,13 @@ def fetch_place_name(lat, lon):
         "addressdetails": 1,
         "accept-language": "en"
     }
-
     try:
         r = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=15)
         r.raise_for_status()
         data = r.json()
         return data.get("display_name", "Unknown location")
-    except Exception:
+    except Exception as e:
+        logging.error(f"Place fetch error: {e}")
         return "Unknown location"
 
 
@@ -37,7 +50,6 @@ def fetch_weather(lat, lon):
         "forecast_days": 1,
         "timezone": "auto",
     }
-
     r = requests.get(WEATHER_URL, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
@@ -73,7 +85,6 @@ def calculate_risk(temp, humidity, apparent_temp, surface_score):
     temp_score = max(0, (temp - 24) * 3)
     humidity_score = max(0, (humidity - 55) * 0.35)
     feels_like_score = max(0, (apparent_temp - 27) * 2)
-
     risk_score = temp_score + humidity_score + feels_like_score + surface_score
     risk_score = max(0, min(100, int(risk_score)))
 
@@ -86,7 +97,6 @@ def calculate_risk(temp, humidity, apparent_temp, surface_score):
     else:
         level = "SAFE"
         advice = "Area is safe for outdoor activity."
-
     return risk_score, level, advice
 
 
@@ -110,7 +120,6 @@ def get_place(lat: float = Query(...), lon: float = Query(...)):
 def get_risk(lat: float = Query(...), lon: float = Query(...), surface: str = Query("Road / Concrete")):
     surface_score = get_surface_score(surface)
     times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
-
     outputs = []
     for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
         temp = temps[index]
@@ -128,53 +137,38 @@ def get_risk(lat: float = Query(...), lon: float = Query(...), surface: str = Qu
             "level": level,
             "advice": advice
         })
-
-    return {
-        "location": {"latitude": lat, "longitude": lon},
-        "surface": surface,
-        "results": outputs
-    }
+    return {"location": {"latitude": lat, "longitude": lon}, "surface": surface, "results": outputs}
 
 
 @app.get("/streets")
 def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = Query(700)):
-    """
-    Fetch real nearby streets from OSM and use English names if available
-    """
     query = f"""
     [out:json][timeout:25];
     way["highway"](around:{radius},{lat},{lon});
     out center tags;
     """
-
     try:
-        r = requests.post(OVERPASS_URL, data={"data": query}, headers={"User-Agent": "AI-Heat-Risk-Demo/1.0"}, timeout=30)
+        r = requests.post(OVERPASS_URL, data={"data": query}, headers=HEADERS, timeout=30)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
+        logging.error(f"Overpass API error: {e}")
         return {"error": str(e), "streets": []}
 
     streets = []
-    seen_names = set()
-
+    seen = set()
     for element in data.get("elements", []):
         tags = element.get("tags", {})
         center = element.get("center")
         if not center:
             continue
-
         highway = tags.get("highway", "road")
-        name = tags.get("name:en") or tags.get("name")
-        if not name:
-            name = f"Unnamed {highway} road"
-
+        name = tags.get("name:en") or tags.get("name") or f"Unnamed {highway} road"
         key = f"{name}-{round(center['lat'],5)}-{round(center['lon'],5)}"
-        if key in seen_names:
+        if key in seen:
             continue
-        seen_names.add(key)
-
+        seen.add(key)
         surface = highway_to_surface(highway)
-
         streets.append({
             "name": name,
             "lat": center["lat"],
@@ -183,42 +177,24 @@ def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = 
             "highway_type": highway,
             "is_real_osm": True
         })
-
     return {"source": "OpenStreetMap Overpass API", "count": len(streets[:20]), "streets": streets[:20]}
 
-    
+
 @app.get("/street-risks")
-def get_street_risks(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    radius: int = Query(900)
-):
+def get_street_risks(lat: float = Query(...), lon: float = Query(...), radius: int = Query(900)):
     place_name = fetch_place_name(lat, lon)
-
     times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
-
     street_data = get_streets(lat, lon, radius)
     streets = street_data.get("streets", [])
-
     results = []
-
     for street in streets:
         surface_score = get_surface_score(street["surface"])
-
         forecasts = []
-
         for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
             temp = temps[index]
             hum = humidity[index]
             apparent_temp = apparent_temps[index]
-
-            risk_score, level, advice = calculate_risk(
-                temp,
-                hum,
-                apparent_temp,
-                surface_score
-            )
-
+            risk_score, level, advice = calculate_risk(temp, hum, apparent_temp, surface_score)
             forecasts.append({
                 "forecast": label,
                 "time": times[index],
@@ -229,7 +205,6 @@ def get_street_risks(
                 "level": level,
                 "advice": advice
             })
-
         results.append({
             "name": street["name"],
             "lat": street["lat"],
@@ -238,7 +213,6 @@ def get_street_risks(
             "highway_type": street["highway_type"],
             "forecasts": forecasts
         })
-
     return {
         "place_name": place_name,
         "latitude": lat,
