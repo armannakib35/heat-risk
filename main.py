@@ -1,40 +1,27 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
 import requests
-import time
 
 app = FastAPI(title="Real Street Heat Risk API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
-
 HEADERS = {"User-Agent": "AI-Heat-Risk-Demo/1.0"}
-CACHE_DURATION = 15 * 60
-
-weather_cache = {}
 
 
 def fetch_place_name(lat, lon):
+    params = {
+        "format": "json",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 18,
+        "addressdetails": 1,
+        "accept-language": "en"
+    }
+
     try:
-        params = {
-            "format": "json",
-            "lat": lat,
-            "lon": lon,
-            "zoom": 18,
-            "addressdetails": 1,
-            "accept-language": "en",
-        }
-        r = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=10)
+        r = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=15)
         r.raise_for_status()
         data = r.json()
         return data.get("display_name", "Unknown location")
@@ -43,14 +30,6 @@ def fetch_place_name(lat, lon):
 
 
 def fetch_weather(lat, lon):
-    key = f"{round(lat, 3)}-{round(lon, 3)}"
-    now = time.time()
-
-    if key in weather_cache:
-        cached = weather_cache[key]
-        if now - cached["saved_at"] < CACHE_DURATION:
-            return cached["data"]
-
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -59,27 +38,15 @@ def fetch_weather(lat, lon):
         "timezone": "auto",
     }
 
-    r = requests.get(WEATHER_URL, params=params, timeout=10)
-
-    if r.status_code == 429 and key in weather_cache:
-        return weather_cache[key]["data"]
-
+    r = requests.get(WEATHER_URL, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
-
-    result = (
+    return (
         data["hourly"]["time"],
         data["hourly"]["temperature_2m"],
         data["hourly"]["relative_humidity_2m"],
         data["hourly"]["apparent_temperature"],
     )
-
-    weather_cache[key] = {
-        "saved_at": now,
-        "data": result,
-    }
-
-    return result
 
 
 def get_surface_score(surface):
@@ -93,12 +60,12 @@ def get_surface_score(surface):
 
 
 def highway_to_surface(highway):
-    if highway in ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified"]:
+    concrete_types = ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified"]
+    mixed_types = ["residential", "service", "living_street", "pedestrian", "footway", "cycleway"]
+    if highway in concrete_types:
         return "Road / Concrete"
-
-    if highway in ["residential", "service", "living_street", "pedestrian", "footway", "cycleway"]:
+    if highway in mixed_types:
         return "Mixed Area"
-
     return "Park / Trees"
 
 
@@ -111,28 +78,21 @@ def calculate_risk(temp, humidity, apparent_temp, surface_score):
     risk_score = max(0, min(100, int(risk_score)))
 
     if risk_score >= 70:
-        return risk_score, "DANGER", "Avoid outdoor exposure and use shaded routes."
+        level = "DANGER"
+        advice = "Avoid outdoor exposure and use shaded routes."
+    elif risk_score >= 40:
+        level = "ALERT"
+        advice = "Take precautions, stay hydrated, and avoid long exposure."
+    else:
+        level = "SAFE"
+        advice = "Area is safe for outdoor activity."
 
-    if risk_score >= 40:
-        return risk_score, "ALERT", "Take precautions, stay hydrated, and avoid long exposure."
-
-    return risk_score, "SAFE", "Area is safe for outdoor activity."
-
-
-def fallback_streets(lat, lon):
-    return [
-        {"name": "Main Concrete Road", "lat": lat + 0.004, "lon": lon + 0.004, "surface": "Road / Concrete", "highway_type": "primary", "is_real_osm": False},
-        {"name": "Busy Market Street", "lat": lat - 0.004, "lon": lon + 0.004, "surface": "Road / Concrete", "highway_type": "secondary", "is_real_osm": False},
-        {"name": "School Mixed Zone", "lat": lat + 0.004, "lon": lon - 0.004, "surface": "Mixed Area", "highway_type": "residential", "is_real_osm": False},
-        {"name": "Green Park Road", "lat": lat - 0.004, "lon": lon - 0.004, "surface": "Park / Trees", "highway_type": "park_path", "is_real_osm": False},
-        {"name": "Hospital Access Road", "lat": lat + 0.006, "lon": lon - 0.0025, "surface": "Mixed Area", "highway_type": "service", "is_real_osm": False},
-        {"name": "Industrial Concrete Lane", "lat": lat - 0.006, "lon": lon + 0.0025, "surface": "Road / Concrete", "highway_type": "industrial", "is_real_osm": False},
-    ]
+    return risk_score, level, advice
 
 
 @app.get("/")
 def home():
-    return FileResponse("frontend.html")
+    return {"message": "Street Heat Risk API is running"}
 
 
 @app.get("/app")
@@ -142,131 +102,86 @@ def mobile_app():
 
 @app.get("/place")
 def get_place(lat: float = Query(...), lon: float = Query(...)):
-    return {
-        "latitude": lat,
-        "longitude": lon,
-        "place_name": fetch_place_name(lat, lon),
-    }
+    place_name = fetch_place_name(lat, lon)
+    return {"latitude": lat, "longitude": lon, "place_name": place_name}
 
 
 @app.get("/risk")
-def get_risk(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    surface: str = Query("Road / Concrete"),
-):
-    try:
-        surface_score = get_surface_score(surface)
-        times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
+def get_risk(lat: float = Query(...), lon: float = Query(...), surface: str = Query("Road / Concrete")):
+    surface_score = get_surface_score(surface)
+    times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
 
-        outputs = []
+    outputs = []
+    for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
+        temp = temps[index]
+        hum = humidity[index]
+        apparent_temp = apparent_temps[index]
+        risk_score, level, advice = calculate_risk(temp, hum, apparent_temp, surface_score)
+        outputs.append({
+            "forecast": label,
+            "time": times[index],
+            "temperature": temp,
+            "humidity": hum,
+            "apparent_temperature": apparent_temp,
+            "surface_score": surface_score,
+            "risk_score": risk_score,
+            "level": level,
+            "advice": advice
+        })
 
-        for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
-            risk_score, level, advice = calculate_risk(
-                temps[index],
-                humidity[index],
-                apparent_temps[index],
-                surface_score,
-            )
-
-            outputs.append({
-                "forecast": label,
-                "time": times[index],
-                "temperature": temps[index],
-                "humidity": humidity[index],
-                "apparent_temperature": apparent_temps[index],
-                "surface_score": surface_score,
-                "risk_score": risk_score,
-                "level": level,
-                "advice": advice,
-            })
-
-        return {
-            "location": {"latitude": lat, "longitude": lon},
-            "surface": surface,
-            "results": outputs,
-        }
-
-    except Exception as e:
-        return {
-            "error": str(e),
-            "location": {"latitude": lat, "longitude": lon},
-            "surface": surface,
-            "results": [],
-        }
+    return {
+        "location": {"latitude": lat, "longitude": lon},
+        "surface": surface,
+        "results": outputs
+    }
 
 
 @app.get("/streets")
-def get_streets(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    radius: int = Query(500),
-):
-    try:
-        query = f"""
-        [out:json][timeout:15];
-        way["highway"](around:{radius},{lat},{lon});
-        out center tags;
-        """
+def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = Query(700)):
+    """
+    Fetch real nearby streets from OSM and use English names if available
+    """
+    query = f"""
+    [out:json][timeout:25];
+    way["highway"](around:{radius},{lat},{lon});
+    out center tags;
+    """
 
-        r = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            headers=HEADERS,
-            timeout=15,
-        )
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": query}, headers={"User-Agent": "AI-Heat-Risk-Demo/1.0"}, timeout=30)
         r.raise_for_status()
         data = r.json()
+    except Exception as e:
+        return {"error": str(e), "streets": []}
 
-        streets = []
-        seen = set()
+    streets = []
+    seen_names = set()
 
-        for element in data.get("elements", []):
-            try:
-                tags = element.get("tags", {})
-                center = element.get("center")
+    for element in data.get("elements", []):
+        tags = element.get("tags", {})
+        center = element.get("center")
+        if not center:
+            continue
 
-                if not center:
-                    continue
+        highway = tags.get("highway", "road")
+        name = tags.get("name:en") or tags.get("name")
+        if not name:
+            name = f"Unnamed {highway} road"
 
-                highway = tags.get("highway", "road")
-                name = tags.get("name:en") or tags.get("name") or f"Unnamed {highway}"
+        key = f"{name}-{round(center['lat'],5)}-{round(center['lon'],5)}"
+        if key in seen_names:
+            continue
+        seen_names.add(key)
 
-                key = f"{name}-{round(center['lat'], 5)}-{round(center['lon'], 5)}"
+        surface = highway_to_surface(highway)
 
-                if key in seen:
-                    continue
+        streets.append({
+            "name": name,
+            "lat": center["lat"],
+            "lon": center["lon"],
+            "surface": surface,
+            "highway_type": highway,
+            "is_real_osm": True
+        })
 
-                seen.add(key)
-
-                streets.append({
-                    "name": name,
-                    "lat": center["lat"],
-                    "lon": center["lon"],
-                    "surface": highway_to_surface(highway),
-                    "highway_type": highway,
-                    "is_real_osm": True,
-                })
-
-            except Exception:
-                continue
-
-        if len(streets) == 0:
-            streets = fallback_streets(lat, lon)
-            source = "Fallback demo streets"
-        else:
-            source = "OpenStreetMap Overpass API"
-
-        return {
-            "source": source,
-            "count": len(streets[:6]),
-            "streets": streets[:6],
-        }
-
-    except Exception:
-        streets = fallback_streets(lat, lon)
-        return {
-            "source": "Fallback demo streets",
-            "count": len(streets),
-            "streets": streets,
-        }
+    return {"source": "OpenStreetMap Overpass API", "count": len(streets[:20]), "streets": streets[:20]}
