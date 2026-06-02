@@ -19,7 +19,6 @@ def fetch_place_name(lat, lon):
         "addressdetails": 1,
         "accept-language": "en"
     }
-
     try:
         r = requests.get(NOMINATIM_URL, params=params, headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -37,7 +36,6 @@ def fetch_weather(lat, lon):
         "forecast_days": 1,
         "timezone": "auto",
     }
-
     r = requests.get(WEATHER_URL, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
@@ -73,7 +71,6 @@ def calculate_risk(temp, humidity, apparent_temp, surface_score):
     temp_score = max(0, (temp - 24) * 3)
     humidity_score = max(0, (humidity - 55) * 0.35)
     feels_like_score = max(0, (apparent_temp - 27) * 2)
-
     risk_score = temp_score + humidity_score + feels_like_score + surface_score
     risk_score = max(0, min(100, int(risk_score)))
 
