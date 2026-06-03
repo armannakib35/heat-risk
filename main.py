@@ -9,7 +9,7 @@ app = FastAPI(title="Real Street Heat Risk API")
 # Enable CORS so frontend can call APIs from other devices
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or restrict to your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -116,30 +116,6 @@ def get_place(lat: float = Query(...), lon: float = Query(...)):
     return {"latitude": lat, "longitude": lon, "place_name": place_name}
 
 
-@app.get("/risk")
-def get_risk(lat: float = Query(...), lon: float = Query(...), surface: str = Query("Road / Concrete")):
-    surface_score = get_surface_score(surface)
-    times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
-    outputs = []
-    for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
-        temp = temps[index]
-        hum = humidity[index]
-        apparent_temp = apparent_temps[index]
-        risk_score, level, advice = calculate_risk(temp, hum, apparent_temp, surface_score)
-        outputs.append({
-            "forecast": label,
-            "time": times[index],
-            "temperature": temp,
-            "humidity": hum,
-            "apparent_temperature": apparent_temp,
-            "surface_score": surface_score,
-            "risk_score": risk_score,
-            "level": level,
-            "advice": advice
-        })
-    return {"location": {"latitude": lat, "longitude": lon}, "surface": surface, "results": outputs}
-
-
 @app.get("/streets")
 def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = Query(700)):
     query = f"""
@@ -180,43 +156,50 @@ def get_streets(lat: float = Query(...), lon: float = Query(...), radius: int = 
     return {"source": "OpenStreetMap Overpass API", "count": len(streets[:20]), "streets": streets[:20]}
 
 
-@app.get("/street-risks")
-def get_street_risks(lat: float = Query(...), lon: float = Query(...), radius: int = Query(900)):
-    place_name = fetch_place_name(lat, lon)
+@app.get("/risk")
+def get_risk(lat: float = Query(...), lon: float = Query(...), surface: str = Query("Road / Concrete")):
+    surface_score = get_surface_score(surface)
     times, temps, humidity, apparent_temps = fetch_weather(lat, lon)
-    street_data = get_streets(lat, lon, radius)
-    streets = street_data.get("streets", [])
-    results = []
-    for street in streets:
-        surface_score = get_surface_score(street["surface"])
-        forecasts = []
-        for label, index in [("Now", 0), ("+2 Hours", 2), ("+6 Hours", 6)]:
-            temp = temps[index]
-            hum = humidity[index]
-            apparent_temp = apparent_temps[index]
-            risk_score, level, advice = calculate_risk(temp, hum, apparent_temp, surface_score)
-            forecasts.append({
-                "forecast": label,
-                "time": times[index],
-                "temperature": temp,
-                "humidity": hum,
-                "apparent_temperature": apparent_temp,
-                "risk_score": risk_score,
-                "level": level,
-                "advice": advice
-            })
-        results.append({
-            "name": street["name"],
-            "lat": street["lat"],
-            "lon": street["lon"],
-            "surface": street["surface"],
-            "highway_type": street["highway_type"],
-            "forecasts": forecasts
+
+    outputs = []
+
+    # 0 to 6 hours, 30-min steps
+    for step in range(13):
+        lower_index = int(step * 0.5)
+        upper_index = min(lower_index + 1, len(temps) - 1)
+        fraction = (step * 0.5) - lower_index
+
+        temp = temps[lower_index] + (temps[upper_index] - temps[lower_index]) * fraction
+        hum = humidity[lower_index] + (humidity[upper_index] - humidity[lower_index]) * fraction
+        apparent_temp = apparent_temps[lower_index] + (apparent_temps[upper_index] - apparent_temps[lower_index]) * fraction
+
+        risk_score, level, advice = calculate_risk(temp, hum, apparent_temp, surface_score)
+
+        # Custom warnings for user
+        if level == "DANGER":
+            warning = "Drink water, use sunscreen, stay in shade, avoid going out if possible."
+        elif level == "ALERT":
+            warning = "Drink water, carry umbrella, limit sun exposure."
+        else:
+            warning = "Low risk. Stay hydrated, carry water."
+
+        outputs.append({
+            "forecast": f"+{step*30} min",
+            "time": times[lower_index],
+            "temperature": round(temp,1),
+            "humidity": round(hum,1),
+            "apparent_temperature": round(apparent_temp,1),
+            "surface_score": surface_score,
+            "risk_score": risk_score,
+            "level": level,
+            "advice": advice,
+            "warning": warning
         })
+
+    outputs[0]["forecast"] = "Now"
+
     return {
-        "place_name": place_name,
-        "latitude": lat,
-        "longitude": lon,
-        "street_count": len(results),
-        "streets": results
+        "location": {"latitude": lat, "longitude": lon},
+        "surface": surface,
+        "results": outputs
     }
